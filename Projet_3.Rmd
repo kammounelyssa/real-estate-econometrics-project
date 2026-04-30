@@ -1,0 +1,867 @@
+```{r}
+library(tidyverse)
+library(arrow)
+library(sf)
+library(lubridate)
+library(fixest)
+library(janitor)
+install.packages("janitor")
+library(stringr)
+install.packages("nngeo")
+library(nngeo)
+install.packages("nabor")
+library(nabor)
+install.packages("giscoR")
+library(giscoR)
+library(ggplot2)
+library(dplyr)
+```
+
+
+```{r load data}
+
+maisons_dit <- read_parquet("maison_dvf+.parquet") 
+inc1 <- read_csv2("inc_2005_2015.csv" , skip = 1)
+inc2 <- read_csv2("inc_2016_2024.csv", skip=1)
+clc6 <- st_read("CLC/CLC12_FR_RGF.shp")
+glimpse(maisons_dit)
+names(maisons_dit)
+
+glimpse(inc1)
+glimpse(inc2)
+
+names(inc1)
+names(inc2)
+```
+
+```{r}
+forets <- clc6 %>%
+  filter(CODE_12 %in% c("311", "312", "313", "324"))
+
+##preparer la donné incendies en mettant les deux base en une seule 
+inc <- bind_rows(inc1, inc2) %>%
+      clean_names()
+
+inc <- inc %>%
+  mutate(
+    annee = as.integer(annee),
+    code_insee = str_pad(as.character(code_insee), width = 5, side = "left", pad = "0")
+  )
+
+
+inc <- inc %>%
+  mutate(
+    date_clean = str_remove(date_de_premiere_alerte, " UTC"),
+    date_alerte = ymd_hms(date_clean)
+  )
+summary(inc$date_alerte)
+sum(is.na(inc$date_alerte))
+
+```
+
+
+```{r}
+first_treat <- inc %>%
+  filter(!is.na(code_insee), !is.na(annee)) %>%
+  group_by(code_insee) %>%
+  summarise(
+    first_treat_year = min(annee, na.rm = TRUE),
+    nb_incendies_total = n(),
+    .groups = "drop"
+  )
+
+glimpse(first_treat)
+
+maisons_dit <- maisons_dit %>%
+  mutate(
+    datemut = as.Date(datemut),
+    annee = as.integer(anneemut),
+    prix = as.numeric(valeur.fonciere),
+    code_insee = stringr::str_pad(as.character(l_codinsee), width = 5, side = "left", pad = "0"),
+    geompar_x = as.numeric(geompar_x),
+    geompar_y = as.numeric(geompar_y),
+    surface_terrain = as.numeric(surface.terrain),
+    surface_bati = as.numeric(surface.bati),
+    nb_pieces = as.numeric(nb.pieces)
+  ) %>%
+  filter(
+    !is.na(prix),
+    prix > 0,
+    !is.na(geompar_x),
+    !is.na(geompar_y),
+    nb.ventes >= 2
+  )
+
+maisons_sf <- st_as_sf(
+  maisons_dit,
+  coords = c("geompar_x", "geompar_y"),
+  crs = 2154,
+  remove = FALSE
+)
+
+forets <- st_transform(forets, 2154)
+forets <- st_make_valid(forets)
+```
+
+```{r}
+# 2) option utile si certaines géométries sont invalides
+forets <- st_make_valid(forets)
+
+# 3) indice de la forêt la plus proche pour chaque maison
+id_foret_proche <- st_nearest_feature(maisons_sf, forets)
+
+# 4) géométrie de la forêt la plus proche
+foret_proche <- forets[id_foret_proche, ]
+
+# 5) distance maison -> forêt la plus proche
+maisons_sf$dist_foret_m <- as.numeric(st_distance(maisons_sf, foret_proche, by_element = TRUE))
+maisons_sf$dist_foret_km <- maisons_sf$dist_foret_m / 1000
+
+
+```
+
+
+```{r}
+maisons_sf <- maisons_sf %>%
+  mutate(
+    near_forest_500m = if_else(dist_foret_m <= 500, 1, 0),
+    near_forest_1km  = if_else(dist_foret_m <= 1000, 1, 0),
+    near_forest_2km  = if_else(dist_foret_m <= 2000, 1, 0)
+  )
+
+
+base_did <- maisons_sf %>%
+  left_join(first_treat, by = "code_insee") %>%
+  mutate(
+    post = if_else(!is.na(first_treat_year) & annee >= first_treat_year, 1, 0),
+    did_500m = near_forest_500m * post,
+    did_1km  = near_forest_1km  * post,
+    did_2km  = near_forest_2km  * post
+  )
+
+summary(maisons_sf$dist_foret_m)
+sum(is.na(maisons_sf$dist_foret_m))
+
+
+```
+
+```{r}
+##base did
+base_did <- maisons_sf %>%
+  left_join(first_treat, by = "code_insee") %>%
+  mutate(
+    post = if_else(!is.na(first_treat_year) & annee >= first_treat_year, 1, 0),
+    did_500m = near_forest_500m * post,
+    did_1km  = near_forest_1km  * post,
+    did_2km  = near_forest_2km  * post
+  )
+
+summary(maisons_sf$dist_foret_m)
+sum(is.na(maisons_sf$dist_foret_m))
+
+plot(st_geometry(maisons_sf[1:1000, ]))
+plot(st_geometry(forets), add = TRUE)
+```
+
+Transformer inc en objet spatial
+
+```{r}
+communes <- communes %>%
+  mutate(code_insee = GISCO_ID)
+
+head(communes$code_insee, 10)
+head(inc$code_insee, 10)
+
+communes <- communes %>%
+  mutate(code_insee = str_remove(code_insee, "^FR"))
+
+head(communes$code_insee, 10)
+head(inc$code_insee, 10)
+
+inc_sf <- inc %>%
+  left_join(communes, by = "code_insee") %>%
+  st_as_sf() %>%
+  st_transform(2154)
+
+```
+
+
+Étape 4 — Construction du panel et de la variable de traitement
+
+```{r}
+##incendie le plus proche 
+id_inc_proche <- st_nearest_feature(maisons_sf, inc_sf)
+inc_proche <- inc_sf[id_inc_proche, ]
+
+##Distance à l'incendie le plus proche
+maisons_sf$dist_inc_m <- as.numeric(
+  st_distance(maisons_sf, inc_proche, by_element = TRUE)
+)
+maisons_sf$dist_inc_km <- maisons_sf$dist_inc_m / 1000
+
+##Date/année de traitement par biens
+maisons_sf$date_traitement <- inc_proche$date_alerte
+maisons_sf$annee_traitement <- lubridate::year(maisons_sf$date_traitement)
+
+maisons_sf <- maisons_sf %>%
+  mutate(
+    post = if_else(
+      !is.na(annee_traitement) & annee >= annee_traitement,
+      1, 0
+    )
+  )
+
+##Groupe traité
+maisons_sf <- maisons_sf %>%
+  mutate(
+    traite_2km = if_else(dist_inc_m <= 2000, 1, 0),
+    traite_5km = if_else(dist_inc_m <= 5000, 1, 0),
+    controle_2_10km = if_else(dist_inc_m > 2000 & dist_inc_m <= 10000, 1, 0),
+    controle_5_20km = if_else(dist_inc_m > 5000 & dist_inc_m <= 20000, 1, 0)
+  )
+
+```
+
+
+
+```{r}
+maisons_sf %>%
+  st_drop_geometry() %>%
+  summarise(
+    n_total = n(),
+    n_10km = sum(dist_inc_m <= 10000, na.rm = TRUE),
+    n_20km = sum(dist_inc_m <= 20000, na.rm = TRUE),
+    n_50km = sum(dist_inc_m <= 50000, na.rm = TRUE),
+    n_100km = sum(dist_inc_m <= 100000, na.rm = TRUE)
+  )
+
+panel_test <- maisons_sf %>%
+  mutate(
+    traite = if_else(dist_inc_m <= 2000, 1, 0),
+    did = traite * post
+  )
+
+panel_test %>%
+  st_drop_geometry() %>%
+  summarise(
+    n_obs = n(),
+    n_biens = n_distinct(l_idpar),
+    n_communes = n_distinct(code_insee)
+  )
+
+
+#panel 20 km
+panel_20km <- maisons_sf %>%
+  filter(dist_inc_m <= 20000) %>%
+  mutate(
+    traite = if_else(dist_inc_m <= 2000, 1, 0),
+    did = traite * post
+  )
+#Panel 50 km
+panel_50km <- maisons_sf %>%
+  filter(dist_inc_m <= 50000) %>%
+  mutate(
+    traite = if_else(dist_inc_m <= 5000, 1, 0),
+    did = traite * post
+  )
+
+summary(maisons_sf$dist_inc_m)
+sum(maisons_sf$dist_inc_m <= 10000, na.rm = TRUE)
+sum(maisons_sf$dist_inc_m <= 50000, na.rm = TRUE)
+```
+```{r}
+communes <- communes %>%
+  mutate(
+    code_insee = GISCO_ID,
+    code_insee = str_remove(code_insee, "^FR"),
+    code_insee = str_remove(code_insee, "^_")
+  )
+head(communes$code_insee, 20)
+head(inc$code_insee, 20)
+
+inc_geo <- inc %>%
+  left_join(communes, by = "code_insee")
+inc_geo %>%
+  summarise(
+    n_total = n(),
+    n_match = sum(!st_is_empty(geometry)),
+    part_match = mean(!st_is_empty(geometry))
+  )
+
+inc_sf <- inc_geo %>%
+  st_as_sf() %>%
+  filter(!st_is_empty(geometry)) %>%
+  st_transform(2154)
+
+
+```
+
+
+```{r}
+communes <- communes %>%
+  mutate(
+    code_insee = GISCO_ID,
+    code_insee = stringr::str_remove(code_insee, "^FR"),
+    code_insee = stringr::str_remove(code_insee, "^_")
+  )
+
+communes_light <- communes %>%
+  select(code_insee, geometry)
+
+inc_geo <- inc %>%
+  left_join(communes_light, by = "code_insee") %>%
+  st_as_sf()
+
+inc_sf <- inc_geo %>%
+  filter(!st_is_empty(geometry)) %>%
+  st_transform(2154) %>%
+  mutate(geometry = st_point_on_surface(geometry))
+
+id_inc_proche <- st_nearest_feature(maisons_sf, inc_sf)
+
+inc_proche <- inc_sf[id_inc_proche, ]
+
+maisons_sf$dist_inc_m <- as.numeric(
+  st_distance(maisons_sf, inc_proche, by_element = TRUE)
+)
+
+maisons_sf$dist_inc_km <- maisons_sf$dist_inc_m / 1000
+
+maisons_sf$date_traitement <- inc_proche$date_alerte
+maisons_sf$annee_traitement <- lubridate::year(maisons_sf$date_traitement)
+
+summary(maisons_sf$dist_inc_m)
+sum(is.na(maisons_sf$dist_inc_m))
+
+plot(st_geometry(inc_sf[1:1000, ]))
+plot(st_geometry(maisons_sf[1:1000, ]), add = TRUE, col = "red")
+
+
+
+
+panel <- maisons_sf %>%
+  filter(!is.na(dist_inc_m)) %>%
+  filter(dist_inc_m <= 20000) %>%
+  mutate(
+    post = if_else(!is.na(annee_traitement) & annee >= annee_traitement, 1, 0),
+    traite_2km = if_else(dist_inc_m <= 2000, 1, 0),
+    traite_5km = if_else(dist_inc_m <= 5000, 1, 0),
+    traite_10km = if_else(dist_inc_m <= 10000, 1, 0)
+  )
+
+summary(maisons_sf$dist_inc_m)
+sum(is.na(maisons_sf$dist_inc_m))
+
+```
+
+DONNÉES Panel
+
+```{r}
+panel <- maisons_sf %>%
+  filter(dist_inc_m <= 20000) %>%
+  mutate(
+    post = if_else(!is.na(annee_traitement) & annee >= annee_traitement, 1, 0),
+    traite_2km  = if_else(dist_inc_m <= 2000, 1, 0),
+    traite_5km  = if_else(dist_inc_m <= 5000, 1, 0),
+    traite_10km = if_else(dist_inc_m <= 10000, 1, 0),
+    did_2km  = traite_2km * post,
+    did_5km  = traite_5km * post,
+    did_10km = traite_10km * post
+  )
+
+table(panel$traite_2km)
+table(panel$traite_5km)
+table(panel$traite_10km)
+table(panel$post)
+
+
+panel %>%
+  st_drop_geometry() %>%
+  summarise(
+    n_obs = n(),
+    n_biens = n_distinct(l_idpar),
+    n_communes = n_distinct(code_insee)
+  )
+```
+Fixer le traitement principal
+
+```{r}
+#TRAITEMENT PRINCIPAL (5KM)
+panel <- panel %>%
+  mutate(
+    traite = traite_5km,
+    did = did_5km
+  )
+#reg principale
+panel <- panel %>%
+  mutate(log_prix = log(prix))
+reg <- feols(
+  log_prix ~ did | l_idpar + annee, data = panel)
+
+summary(reg)
+
+#reg avec controle
+reg2 <- feols(
+  log_prix ~ did + surface_bati + surface_terrain + nb_pieces |
+    l_idpar + annee,
+  data = panel
+)
+
+summary(reg2)
+#reg robuste
+reg_robust <- feols(
+  log_prix ~ did_2km | l_idpar + annee,
+  data = panel
+)
+
+
+```
+
+
+Etape 5: DEBUT DES STATS DESCIRIPTIVES
+taille et structure du panel INDISPENSABLE
+```{r}
+panel %>%
+  st_drop_geometry() %>%
+  summarise(
+    n_obs = n(),
+    n_biens = n_distinct(l_idpar),
+    n_communes = n_distinct(code_insee)
+  )
+```
+repartition entre traité et controle
+```{r}
+panel %>%
+  st_drop_geometry() %>%
+  group_by(traite) %>%
+  summarise(n = n())
+```
+repartiton avant/apres INDISPENSABLE
+
+```{r}
+panel %>%
+  st_drop_geometry() %>%
+  group_by(post) %>%
+  summarise(n = n())
+
+```
+
+Tableau croisé (tableau clé du DiD) INDSPENSABLE +++
+
+```{r}
+panel %>%
+  st_drop_geometry() %>%
+  group_by(traite, post) %>%
+  summarise(n = n(), .groups = "drop")
+```
+Prix moyen par groupe INDISPENSABLE
+
+```{r}
+panel %>%
+  st_drop_geometry() %>%
+  group_by(traite, post) %>%
+  summarise(
+    prix_moyen = mean(prix, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+Evolution temporelle des prix
+
+```{r}
+
+panel %>%
+  st_drop_geometry() %>%
+  group_by(annee, traite) %>%
+  summarise(
+    prix_moyen = mean(prix, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = annee, y = prix_moyen, color = as.factor(traite))) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(
+    title = "Évolution du prix moyen par groupe",
+    x = "Année",
+    y = "Prix moyen",
+    color = "Traité"
+  ) +
+  theme_minimal()
+```
+Distribution des distances incendie
+```{r}
+panel %>%
+  st_drop_geometry() %>%
+  ggplot(aes(x = dist_inc_km),) +
+  geom_histogram(bins = 50,color="orange",fill="orange") +
+  labs(
+    title = "Distribution des distances à l'incendie",
+    x = "Distance (km)",
+    y = "Fréquence"
+  )+
+theme_minimal()
+
+```
+```{r}
+summary(panel$dist_inc_km)
+```
+
+Statistiques distance (tableau)
+```{r}
+panel %>%
+  st_drop_geometry() %>%
+  summarise(
+    mean = mean(dist_inc_km, na.rm = TRUE),
+    median = median(dist_inc_km, na.rm = TRUE),
+    p25 = quantile(dist_inc_km, 0.25, na.rm = TRUE),
+    p75 = quantile(dist_inc_km, 0.75, na.rm = TRUE),
+    max = max(dist_inc_km, na.rm = TRUE)
+  )
+
+```
+preparation des données
+```{r}
+# Tout en WGS84 pour l'affichage ggplot le plus simple
+communes_wgs <- st_transform(communes, 4326)
+forets_wgs   <- st_transform(forets, 4326)
+inc_sf_wgs   <- st_transform(inc_sf, 4326)
+maisons_wgs  <- st_transform(maisons_sf, 4326)
+
+# Sous-échantillon de maisons pour éviter une carte illisible
+set.seed(123)
+maisons_sample_wgs <- maisons_wgs %>%
+  slice_sample(n = 30000)
+
+# Boîte englobante de la France métropolitaine
+bbox_metro <- st_bbox(c(xmin = -5.5, xmax = 10, ymin = 41, ymax = 51.5), crs = st_crs(4326))
+bbox_metro_sf <- st_as_sfc(bbox_metro)
+
+# Garder seulement ce qui intersecte la métropole
+communes_metro <- st_intersection(communes_wgs, bbox_metro_sf)
+forets_metro   <- st_intersection(forets_wgs, bbox_metro_sf)
+inc_metro      <- st_intersection(inc_sf_wgs, bbox_metro_sf)
+maisons_metro  <- st_intersection(maisons_wgs, bbox_metro_sf)
+```
+
+carte communes+forets 
+```{r}
+ggplot() +
+  geom_sf(data = communes_metro, fill = "grey95", color = "lightblue", linewidth = 0.05) +
+  geom_sf(data = forets_metro, fill = "darkgreen", color = NA, alpha = 0.6) +
+  coord_sf(xlim = c(-5.5, 10), ylim = c(41, 51.5), expand = FALSE) +
+  labs(title = "Communes et zones forestières en France") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.title = element_blank()
+  )
+```
+carte communes +incendies
+```{r}
+ggplot() +
+  geom_sf(data = communes_metro, fill = "grey95", color = "darkblue", linewidth = 0.05) +
+  geom_sf(data = inc_metro, color = "red", size = 0.25, alpha = 0.4) +
+  coord_sf(xlim = c(-5.5, 10), ylim = c(41, 51.5), expand = FALSE) +
+  labs(title = "Communes et incendies en France") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.title = element_blank()
+  )
+```
+CARTE MAISONS+FORETS+INCENDIES
+```{r}
+# Échantillon maisons
+set.seed(123)
+maisons_sample <- maisons_wgs %>%
+  slice_sample(n = 20000) %>%
+  mutate(type = "Maisons")
+
+# Incendies
+inc_plot <- inc_sf_wgs %>%
+  mutate(type = "Incendies")
+
+# Combiner
+points_plot <- bind_rows(maisons_sample, inc_plot)
+
+ggplot() +
+  # Fond communes
+  geom_sf(data = communes_metro, fill = "grey95", color = "grey80", linewidth = 0.05) +
+  
+  # Forêts
+  geom_sf(data = forets_metro, fill = "darkgreen", color = NA, alpha = 0.4) +
+  
+  # Points (maisons + incendies)
+  geom_sf(data = points_plot, aes(color = type), alpha = 0.6, size = 0.3) +
+  
+  # Couleurs propres
+  scale_color_manual(
+    values = c(
+      "Maisons" = "blue",
+      "Incendies" = "red"
+    ),
+    name = "Légende"
+  ) +
+  coord_sf(
+  xlim = c(-5.5, 10),
+  ylim = c(41, 51.5),
+  expand = FALSE
+)+
+  labs(
+    title = "Maisons, forêts et incendies en France",
+  ) +
+  
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    legend.position = "right",
+    axis.title = element_blank()
+  )
+```
+
+```{r}
+maisons_trait <- maisons_wgs %>%
+  filter(dist_inc_km <= 5) %>%
+  slice_sample(n = 20000)
+
+ggplot() +
+  geom_sf(data = communes_metro, fill = "blue", color = "lightblue") +
+  geom_sf(data = forets_metro, fill = "lightblue", alpha = 0.4) +
+  geom_sf(data = maisons_trait, color = "red", size = 0.3, alpha = 0.5) +
+  labs(title = "Maisons situées à moins de 5 km d’un incendie") +
+  theme_minimal()
+```
+ graphique evolution temporelle 
+```{r}
+panel %>%
+  st_drop_geometry() %>%
+  group_by(annee, traite) %>%
+  summarise(prix_moyen = mean(prix, na.rm = TRUE)) %>%
+  ggplot(aes(x = annee, y = prix_moyen, color = as.factor(traite))) +
+  geom_line(size = 1.2) +
+  labs(
+    title = "Évolution du prix moyen",
+    x = "Année",
+    y = "Prix moyen",
+    color = "Traité"
+  ) +
+  theme_minimal()
+```
+Variables structurels 
+```{r}
+panel %>%
+  st_drop_geometry() %>%
+  summarise(
+    prix_moy = mean(prix, na.rm = TRUE),
+    surface_moy = mean(surface_bati, na.rm = TRUE),
+    terrain_moy = mean(surface_terrain, na.rm = TRUE),
+    pieces_moy = mean(nb_pieces, na.rm = TRUE)
+  )
+```
+comparaison traité VS controle 
+
+```{r}
+panel %>%
+  st_drop_geometry() %>%
+  group_by(traite) %>%
+  summarise(
+    prix = mean(prix, na.rm = TRUE),
+    surface = mean(surface_bati, na.rm = TRUE)
+  )
+```
+
+ÉTAPE 6 : REGRESSIONS DiD
+
+modele principal
+```{r}
+summary(panel$log_prix)
+table(panel$did)
+
+reg1 <- feols(
+  log_prix ~ did | l_idpar + annee,
+  data = panel
+)
+
+
+```
+
+Modele avec controle
+```{r}
+reg2 <- feols(
+  log_prix ~ did + surface_bati + surface_terrain + nb_pieces |
+    l_idpar + annee,
+  data = panel
+)
+
+```
+modele robuste (distance)
+```{r}
+reg3 <- feols(
+  log_prix ~ did_2km | l_idpar + annee,
+  data = panel
+)
+
+reg4 <- feols(
+  log_prix ~ did_5km | l_idpar + annee,
+  data = panel
+)
+
+reg5 <- feols(
+  log_prix ~ did_10km | l_idpar + annee,
+  data = panel
+)
+```
+
+```{r}
+etable(reg1,reg2,reg3,reg4,reg5)
+```
+
+
+ETAPE 7: EVENT STUDY TWFE
+creer rel_time
+```{r}
+panel <- panel %>%
+  mutate(
+    rel_time = annee - annee_traitement
+  )
+```
+
+-Inf si jamais traité
+```{r}
+panel <- panel %>%
+  mutate(
+    rel_time = ifelse(is.na(annee_traitement), -Inf, rel_time)
+  )
+```
+
+Filtrer les valeurs infinies (sinon erreur)
+```{r}
+panel_es <- panel %>%
+  filter(is.finite(rel_time))
+```
+
+Estimation TWFE   avec feols()
+```{r}
+es_twfe <- feols(
+  log_prix ~ i(rel_time, ref = -1) | l_idpar + annee,
+  cluster = ~code_insee,
+  data = panel_es
+)
+```
+
+```{r}
+iplot(es_twfe)
+```
+
+
+
+
+```{r}
+panel <- panel %>%
+  mutate(id_bien = paste0(geompar_x, "_", geompar_y))
+
+panel <- panel %>%
+  filter(nb.ventes >= 2)
+table(panel$nb.ventes)
+
+
+panel %>%
+  group_by(id_bien) %>%
+  summarise(n = n()) %>%
+  summary()
+panel <- panel %>%
+mutate(id_bien = paste0 (geompar_x,"_", geompar_y))
+
+panel <- panel %>%
+mutate(id_bien_num = as.numeric(as.factor(id_bien)))
+
+head (panel$id_bien)
+head(panel$id_bien_num)
+
+```
+
+```{r}
+library(did)
+
+att <- att_gt(
+  yname  = "log_prix",
+  tname  = "annee",
+  idname = "id_bien",
+  gname  = "annee_traitement",
+  data   = panel,
+  control_group = "notyettreated"
+)
+```
+
+CALLAWAY
+```{r}
+
+panel_cs <- panel %>%
+  st_drop_geometry() %>%
+  mutate(
+    log_prix = log(prix),
+    id_bien = paste0(geompar_x, "_", geompar_y),
+    id_bien_num = as.numeric(as.factor(id_bien)),
+    annee_traitement = as.numeric(annee_traitement)
+  ) %>%
+  filter(
+    !is.na(log_prix),
+    !is.na(annee),
+    !is.na(id_bien_num),
+    !is.na(annee_traitement)
+  )
+names(panel_cs)
+summary(panel_cs$log_prix)
+summary(panel_cs$annee_traitement)
+
+
+panel_cs <- panel %>%
+  st_drop_geometry() %>%
+  mutate(
+    log_prix = log(prix),
+    id_bien = paste0(geompar_x, "_", geompar_y),
+    id_bien_num = as.numeric(as.factor(id_bien)),
+
+    # UTILISE traite_5km (ou 2km si tu veux)
+    g_cs = if_else(traite_5km == 1,
+                   as.numeric(annee_traitement),
+                   0)
+  ) %>%
+  filter(
+    !is.na(log_prix),
+    !is.na(annee),
+    !is.na(id_bien_num),
+    !is.na(g_cs)
+  ) %>%
+  distinct(id_bien_num, annee, .keep_all = TRUE)
+
+table(panel_cs$g_cs == 0)
+summary(panel_cs$g_cs)
+
+att <- att_gt(
+  yname = "log_prix",
+  tname = "annee",
+  idname = "id_bien_num",
+  gname = "g_cs",
+  data = panel_cs,
+  control_group = "notyettreated",
+  faster_mode = FALSE,
+  allow_unbalanced_panel = TRUE
+)
+agg_simple <- aggte(att, type = "simple")
+summary(agg_simple)
+
+
+```
+
+
+```{r}
+agg_dyn <- aggte(att, type = "dynamic")
+ggdid(agg_dyn)
+```
+
+```{r}
+class(att)
+```
+
